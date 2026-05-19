@@ -1,0 +1,19 @@
+# Isolate local Python virtual environment
+venv/
+.venv/
+
+# Lock down private configuration and API keys
+.streamlit/secrets.toml
+
+# Exclude temporary media caching directories
+temp_*
+
+# Prevent Python compilation artifacts from bloating the repo
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Operating system files
+.DS_Store
+Thumbs.db
