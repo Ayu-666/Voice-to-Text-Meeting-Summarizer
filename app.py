@@ -9,7 +9,7 @@ Run      : streamlit run app.py
 Secrets (.streamlit/secrets.toml or Streamlit Cloud > Settings > Secrets):
     GROQ_API_KEY   = "gsk_..."
     GEMINI_API_KEY = "AIza..."
-    GEMINI_MODEL   = "gemini-2.5-flash"   # optional override
+    GEMINI_MODEL   = "gemini-3.8-flash"   # optional: force one model (otherwise MeetMind auto-picks one your key can use)
 
 Dependencies: streamlit>=1.40, requests, pandas, fpdf2   (no new dependencies vs. v1)
 """
@@ -38,7 +38,9 @@ st.set_page_config(
 MAX_MB = 25
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_MODEL = "whisper-large-v3-turbo"
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+# Tried in order; the first model your key can actually use is remembered for the session.
+# (gemini-2.5-flash now returns 404 for many newer API keys, so it is only the last resort.)
+GEMINI_FALLBACKS = ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-2.5-flash"]
 PRIORITIES = ["High", "Medium", "Low"]
 PRIORITY_RANK = {"High": 0, "Medium": 1, "Low": 2}
 STATUSES = ["To Do", "In Progress"]
@@ -355,6 +357,17 @@ TRANSCRIPT:
 \"\"\""""
 
 
+class ModelUnavailable(UserFacingError):
+    """This model can't be used with the current key right now (not found / quota) - try the next one."""
+
+
+def _api_detail(r) -> str:
+    try:
+        return str(r.json().get("error", {}).get("message", ""))[:200]
+    except (ValueError, AttributeError):
+        return r.text[:200]
+
+
 def call_gemini(prompt: str, api_key: str, model: str) -> str:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     try:
@@ -372,17 +385,41 @@ def call_gemini(prompt: str, api_key: str, model: str) -> str:
     if r.status_code in (401, 403) or (r.status_code == 400 and "API_KEY" in r.text.upper()):
         raise UserFacingError("Gemini rejected your API key. Double-check it in the sidebar (free keys: aistudio.google.com).")
     if r.status_code == 404:
-        raise UserFacingError(f"Gemini model `{model}` wasn't found. Set a valid `GEMINI_MODEL` in your secrets.")
+        raise ModelUnavailable(f"`{model}` isn't available for your API key.")
     if r.status_code == 429:
-        raise UserFacingError("Gemini's free-tier rate limit was hit. Wait a minute and try again.")
+        raise ModelUnavailable(f"The free-tier rate limit or quota for `{model}` was hit.")
     if r.status_code >= 500:
         raise UserFacingError("Gemini is temporarily unavailable. Please try again shortly.")
     if r.status_code != 200:
-        raise UserFacingError(f"Gemini returned an error (status {r.status_code}). Please try again.")
+        detail = _api_detail(r)
+        raise UserFacingError(f"Gemini returned an error (status {r.status_code})" + (f": {detail}" if detail else "."))
     try:
         return r.json()["candidates"][0]["content"]["parts"][0]["text"]
     except (KeyError, IndexError, ValueError):
         raise UserFacingError("Gemini returned an empty answer (it may have been filtered). Please click Analyze again.")
+
+
+def call_gemini_any(prompt: str, api_key: str, preferred: str = "") -> str:
+    """Call Gemini, automatically moving to the next model if one is unavailable for this key."""
+    order = []
+    for mdl in [preferred, st.session_state.get("gemini_ok"), *GEMINI_FALLBACKS]:
+        if mdl and mdl not in order:
+            order.append(mdl)
+    tried, last = [], None
+    for mdl in order:
+        try:
+            text = call_gemini(prompt, api_key, mdl)
+            st.session_state.gemini_ok = mdl
+            return text
+        except ModelUnavailable as e:
+            tried.append(mdl)
+            last = e
+            if st.session_state.get("gemini_ok") == mdl:
+                st.session_state.gemini_ok = None
+    raise UserFacingError(
+        f"{last} Models tried: {', '.join(tried)}. Wait a minute and try again, or set `GEMINI_MODEL` to a model "
+        "your key can use (see ai.google.dev/gemini-api/docs/models)."
+    )
 
 
 def _strs(val) -> list:
@@ -491,7 +528,7 @@ def normalize_minutes(data, kind: str, transcript: str) -> dict:
 def extract_minutes(transcript: str, kind: str, attendees: str, api_key: str, model: str) -> dict:
     prompt = build_prompt(transcript, kind, attendees)
     for _ in range(2):  # one automatic retry if the AI returns malformed JSON
-        raw = call_gemini(prompt, api_key, model)
+        raw = call_gemini_any(prompt, api_key, model)
         try:
             return normalize_minutes(_parse_json(raw), kind, transcript)
         except (ValueError, TypeError):
@@ -524,7 +561,7 @@ def items_to_df(items: list) -> pd.DataFrame:
 # ----------------------------------------------------------------------------
 def run_pipeline(audio_bytes, filename, transcript_text, kind, attendees, auto_purge, source):
     groq_key, gem_key = secret("GROQ_API_KEY"), secret("GEMINI_API_KEY")
-    model = secret("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL
+    model = secret("GEMINI_MODEL")  # optional override; empty = auto-select
     had_audio = audio_bytes is not None  # remember before the raw audio reference is dropped
 
     missing = []
