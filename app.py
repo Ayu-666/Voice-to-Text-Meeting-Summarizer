@@ -1,625 +1,838 @@
+import hashlib
 import json
-import uuid
-from datetime import date, datetime, timedelta
+import os
+import re
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
 from groq import Groq
 
-# PDF export is optional: if fpdf2 isn't installed, the rest of the app still works.
-try:
-    from fpdf import FPDF
-    PDF_AVAILABLE = True
-except ImportError:
-    PDF_AVAILABLE = False
 
 # ==========================================
-# 1. PAGE SETUP
+# Configuration
 # ==========================================
 
 st.set_page_config(
-    page_title="BBIT Summarizer",
+    page_title="Smart Meeting Summarizer",
     page_icon="📝",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
+
+WHISPER_MODEL = "whisper-large-v3"
+LLM_MODEL = "openai/gpt-oss-20b"
+MAX_AUDIO_BYTES = 25 * 1024 * 1024
+SUPPORTED_AUDIO_TYPES = [
+    "mp3",
+    "wav",
+    "m4a",
+    "webm",
+    "mp4",
+    "mpeg",
+    "mpga",
+    "ogg",
+    "flac",
+]
+PRIORITIES = ["High", "Medium", "Low"]
+TASK_COLUMNS = [
+    "Done",
+    "Task Description",
+    "Assigned Person",
+    "Priority",
+    "Deadline",
+]
+
+
+# ==========================================
+# Session state
+# ==========================================
+
+def initialize_session_state():
+    defaults = {
+        "analysis": None,
+        "transcript": "",
+        "source_fingerprint": "",
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def safe_text(value, default=""):
+    if value is None:
+        return default
+    try:
+        if pd.isna(value):
+            return default
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    return text if text else default
+
+
+def safe_bool(value):
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "yes", "1", "done", "complete", "completed"}
+    try:
+        if pd.isna(value):
+            return False
+    except (TypeError, ValueError):
+        pass
+    return bool(value)
+
+
+def normalize_task(task):
+    task = task if isinstance(task, dict) else {}
+
+    description = safe_text(
+        task.get("Task Description", task.get("task", task.get("description", "")))
+    )
+    assigned = safe_text(
+        task.get("Assigned Person", task.get("assignee", task.get("assigned_to", ""))),
+        "Unassigned",
+    )
+    raw_priority = safe_text(task.get("Priority", task.get("priority", "Medium"))).title()
+    priority = raw_priority if raw_priority in PRIORITIES else "Medium"
+    deadline = safe_text(
+        task.get("Deadline", task.get("deadline", task.get("due_date", ""))),
+        "Not specified",
+    )
+    done = safe_bool(task.get("Done", task.get("done", False)))
+    status = "Complete" if done else safe_text(task.get("Status", task.get("status", "")), "Open")
+
+    return {
+        "Done": done,
+        "Task Description": description,
+        "Assigned Person": assigned,
+        "Priority": priority,
+        "Deadline": deadline,
+        "Status": status,
+        "Evidence": safe_text(task.get("Evidence", task.get("evidence", ""))),
+        "Blocker": safe_text(task.get("Blocker", task.get("blocker", ""))),
+    }
+
+
+def as_items(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    return []
+
+
+def normalize_note_items(value):
+    notes = []
+    for item in as_items(value):
+        if isinstance(item, dict):
+            text = safe_text(
+                item.get(
+                    "text",
+                    item.get(
+                        "decision",
+                        item.get("topic", item.get("name", item.get("description", ""))),
+                    ),
+                )
+            )
+            evidence = safe_text(item.get("evidence", item.get("Evidence", "")))
+        else:
+            text = safe_text(item)
+            evidence = ""
+        if text:
+            notes.append({"text": text, "evidence": evidence})
+    return notes
+
+
+def normalize_analysis(raw_data, transcript):
+    if not isinstance(raw_data, dict):
+        raise ValueError("The AI response must be a JSON object.")
+
+    summary = [
+        safe_text(item)
+        for item in as_items(raw_data.get("executive_summary", raw_data.get("summary", [])))
+        if safe_text(item)
+    ]
+    tasks = []
+    for raw_task in as_items(raw_data.get("tasks", [])):
+        normalized = normalize_task(raw_task)
+        if normalized["Task Description"]:
+            tasks.append(normalized)
+
+    title = safe_text(
+        raw_data.get("meeting_title", raw_data.get("title", "")),
+        "Meeting / lecture notes",
+    )
+    content_type = safe_text(
+        raw_data.get("content_type", raw_data.get("meeting_type", "")),
+        "Not specified",
+    ).title()
+    if content_type.lower() not in {"meeting", "lecture", "mixed", "not specified"}:
+        content_type = "Not specified"
+
+    return {
+        "meeting_title": title,
+        "content_type": content_type,
+        "date": safe_text(raw_data.get("date", ""), "Not specified"),
+        "participants": normalize_note_items(raw_data.get("participants", [])),
+        "topics": normalize_note_items(raw_data.get("topics", [])),
+        "executive_summary": summary,
+        "decisions": normalize_note_items(raw_data.get("decisions", [])),
+        "tasks": tasks,
+        "blockers": normalize_note_items(raw_data.get("blockers", [])),
+        "follow_ups": normalize_note_items(raw_data.get("follow_ups", [])),
+        "open_questions": normalize_note_items(raw_data.get("open_questions", [])),
+        "transcript": transcript,
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+
+
+def sync_task_editor():
+    """Copy data-editor changes into durable session state before rerendering."""
+    current_analysis = st.session_state.get("analysis")
+    if not isinstance(current_analysis, dict):
+        return
+
+    edited_value = st.session_state.get("task_editor")
+    original_tasks = current_analysis.get("tasks", [])
+    is_delta = isinstance(edited_value, dict) and any(
+        key in edited_value for key in ("edited_rows", "added_rows", "deleted_rows")
+    )
+
+    if isinstance(edited_value, pd.DataFrame):
+        records = edited_value.to_dict(orient="records")
+    elif isinstance(edited_value, list):
+        records = edited_value
+    elif is_delta:
+        # Streamlit versions may store a data-editor delta in session state instead of
+        # the complete edited DataFrame.
+        records = []
+        for task in original_tasks:
+            normalized = normalize_task(task)
+            row = {column: normalized[column] for column in TASK_COLUMNS}
+            row.update({
+                "Evidence": normalized["Evidence"],
+                "Blocker": normalized["Blocker"],
+            })
+            records.append(row)
+
+        edited_rows = edited_value.get("edited_rows", {})
+        if isinstance(edited_rows, dict):
+            for row_index, changes in edited_rows.items():
+                try:
+                    row_index = int(row_index)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= row_index < len(records) and isinstance(changes, dict):
+                    records[row_index].update(changes)
+
+        deleted_rows = set()
+        for row_index in edited_value.get("deleted_rows", []):
+            try:
+                deleted_rows.add(int(row_index))
+            except (TypeError, ValueError):
+                continue
+        records = [
+            row for index, row in enumerate(records)
+            if index not in deleted_rows
+        ]
+
+        added_rows = edited_value.get("added_rows", [])
+        if isinstance(added_rows, list):
+            for row in added_rows:
+                if isinstance(row, dict):
+                    new_task = dict(row)
+                    new_task.setdefault("Evidence", "")
+                    new_task.setdefault("Blocker", "")
+                    records.append(new_task)
+    else:
+        return
+
+    updated_tasks = []
+    for index, row in enumerate(records):
+        if not isinstance(row, dict):
+            continue
+
+        original = original_tasks[index] if index < len(original_tasks) else {}
+        task = normalize_task(
+            {
+                **row,
+                "Evidence": row.get("Evidence", original.get("Evidence", "")),
+                "Blocker": row.get("Blocker", original.get("Blocker", "")),
+            }
+        )
+        if task["Task Description"]:
+            task["Status"] = "Complete" if task["Done"] else "Open"
+            updated_tasks.append(task)
+
+    current_analysis["tasks"] = updated_tasks
+    st.session_state["analysis"] = current_analysis
+    if is_delta:
+        # The canonical task list now contains these edits; clearing the delta avoids
+        # replaying added/deleted rows against the updated list on a later rerun.
+        st.session_state["task_editor"] = {
+            "edited_rows": {},
+            "added_rows": [],
+            "deleted_rows": [],
+        }
+
+
+initialize_session_state()
+
+
+# ==========================================
+# Groq and response helpers
+# ==========================================
+
+def get_saved_api_key():
+    try:
+        return safe_text(st.secrets.get("GROQ_API_KEY", ""))
+    except Exception:
+        return ""
+
+
+def audio_filename(audio_source):
+    original_name = safe_text(getattr(audio_source, "name", ""), "recording.wav")
+    original_name = os.path.basename(original_name)
+    original_name = re.sub(r"[^A-Za-z0-9._-]", "_", original_name)
+
+    if "." not in original_name:
+        mime_type = safe_text(getattr(audio_source, "type", "")).lower()
+        extension_by_mime = {
+            "audio/mpeg": "mp3",
+            "audio/mp3": "mp3",
+            "audio/wav": "wav",
+            "audio/x-wav": "wav",
+            "audio/mp4": "m4a",
+            "audio/x-m4a": "m4a",
+            "audio/webm": "webm",
+            "audio/ogg": "ogg",
+            "audio/flac": "flac",
+        }
+        extension = extension_by_mime.get(mime_type, "wav")
+        original_name = f"recording.{extension}"
+
+    return original_name
+
+
+def source_hash(kind, content):
+    return hashlib.sha256(kind.encode("utf-8") + b"\0" + content).hexdigest()
+
+
+def transcribe_audio(client, audio_source, audio_bytes):
+    if not audio_bytes:
+        raise ValueError("The selected audio file is empty.")
+    if len(audio_bytes) > MAX_AUDIO_BYTES:
+        raise ValueError(
+            "This audio file is larger than Groq's 25 MB transcription limit. "
+            "Use a smaller or compressed file."
+        )
+
+    filename = audio_filename(audio_source)
+    transcription = client.audio.transcriptions.create(
+        file=(filename, audio_bytes),
+        model=WHISPER_MODEL,
+        response_format="text",
+    )
+
+    if isinstance(transcription, str):
+        transcript = transcription.strip()
+    else:
+        transcript = safe_text(getattr(transcription, "text", transcription))
+
+    if not transcript:
+        raise ValueError(
+            "No speech was detected in the audio. Try a clearer recording or paste a transcript."
+        )
+    return transcript
+
+
+def build_prompt(transcript):
+    return f"""
+You are an evidence-grounded assistant for meetings and lectures. Analyze the transcript and return
+one valid JSON object only. Do not use Markdown fences or add facts from outside the transcript.
+
+Rules:
+- Classify the content as Meeting, Lecture, Mixed, or Not specified.
+- Use only names, dates, decisions, commitments, and tasks that the speaker explicitly states or
+  that are unambiguously agreed in the transcript.
+- A suggestion, possibility, question, or unaccepted proposal is not a decision or a task.
+- Never invent participants, assignees, priorities, deadlines, or task status.
+- Only include tasks that have a concrete action. Use "Unassigned" when no owner is stated and
+  "Not specified" when no deadline is stated.
+- Use High, Medium, or Low for priority only when supported by urgency/importance in the transcript;
+  otherwise use Medium.
+- Keep summaries concise and informative. Return 3–5 summary bullets when the transcript supports it.
+- Add brief exact or faithful evidence snippets for each decision and task. Leave evidence empty if
+  there is no concise supporting excerpt; do not fabricate a quote.
+- If something is absent or uncertain, use an empty array or "Not specified", as appropriate.
+
+Return exactly this shape:
+{{
+  "meeting_title": "short title or Meeting / lecture notes",
+  "content_type": "Meeting | Lecture | Mixed | Not specified",
+  "date": "explicit date or Not specified",
+  "participants": ["names explicitly mentioned as participants"],
+  "topics": ["topic"],
+  "executive_summary": ["concise point"],
+  "decisions": [{{"text": "decision", "evidence": "supporting excerpt"}}],
+  "tasks": [
+    {{
+      "Task Description": "specific action",
+      "Assigned Person": "explicit owner or Unassigned",
+      "Priority": "High | Medium | Low",
+      "Deadline": "explicit date/deadline or Not specified",
+      "Evidence": "supporting excerpt",
+      "Blocker": "stated blocker or empty string"
+    }}
+  ],
+  "blockers": [{{"text": "stated blocker", "evidence": "supporting excerpt"}}],
+  "follow_ups": [{{"text": "explicit follow-up", "evidence": "supporting excerpt"}}],
+  "open_questions": ["question that remains unresolved"]
+}}
+
+TRANSCRIPT:
+{transcript}
+"""
+
+
+def extract_json_object(content):
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("The AI returned an empty response.")
+
+    cleaned = content.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    start = cleaned.find("{")
+    if start == -1:
+        raise ValueError("The AI response did not contain a JSON object.")
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(cleaned)):
+        character = cleaned[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+
+        if character == '"':
+            in_string = True
+        elif character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                return cleaned[start : index + 1]
+
+    raise ValueError("The AI response contained incomplete or malformed JSON.")
+
+
+def parse_analysis(content, transcript):
+    json_text = extract_json_object(content)
+    try:
+        raw_data = json.loads(json_text)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"The AI response was malformed JSON: {error.msg}.") from None
+    return normalize_analysis(raw_data, transcript)
+
+
+def friendly_api_error(error, phase):
+    """Return a safe user-facing error without exposing provider payloads or credentials."""
+    detail = str(error).lower()
+
+    if any(token in detail for token in ("401", "invalid_api_key", "authentication", "unauthorized")):
+        return "Groq rejected the API key. Check the key and try again."
+    if any(token in detail for token in ("429", "rate_limit", "rate limit", "too many requests")):
+        return "Groq rate limit reached. Wait a moment, then try again."
+    if any(token in detail for token in ("timeout", "timed out", "connection", "network")):
+        return f"Network trouble interrupted {phase}. Check your connection and retry."
+    if any(token in detail for token in ("413", "payload too large", "file too large")):
+        return "The audio is too large for transcription. Use a smaller or compressed file."
+    if any(token in detail for token in ("unsupported", "invalid file", "format")):
+        return "Groq could not read this audio format. Try MP3, WAV, M4A, WEBM, OGG, or FLAC."
+    return f"{phase.capitalize()} failed. Check your Groq access and connection, then try again."
+
+
+# ==========================================
+# Export helpers
+# ==========================================
+
+def task_dataframe(tasks):
+    rows = []
+    for task in tasks:
+        normalized = normalize_task(task)
+        rows.append({column: normalized[column] for column in TASK_COLUMNS})
+    return pd.DataFrame(rows, columns=TASK_COLUMNS)
+
+
+def render_note_section(title, notes):
+    if not notes:
+        return
+    st.markdown(f"**{title}**")
+    for note in notes:
+        st.markdown(f"- {note['text']}")
+        if note.get("evidence"):
+            st.caption(f'  Evidence: “{note["evidence"]}”')
+
+
+def markdown_export(analysis):
+    lines = [
+        f"# {analysis.get('meeting_title', 'Meeting / lecture notes')}",
+        "",
+        f"- **Type:** {analysis.get('content_type', 'Not specified')}",
+        f"- **Date:** {analysis.get('date', 'Not specified')}",
+        f"- **Generated:** {analysis.get('generated_at', 'Not specified')}",
+        "",
+        "## Executive Summary",
+        "",
+    ]
+    lines.extend(f"- {item}" for item in analysis.get("executive_summary", []))
+
+    for section_title, key in (
+        ("Topics", "topics"),
+        ("Participants", "participants"),
+        ("Decisions", "decisions"),
+        ("Blockers", "blockers"),
+        ("Follow-ups", "follow_ups"),
+        ("Open Questions", "open_questions"),
+    ):
+        notes = analysis.get(key, [])
+        if notes:
+            lines.extend(["", f"## {section_title}", ""])
+            for note in notes:
+                lines.append(f"- {note['text']}")
+                if note.get("evidence"):
+                    lines.append(f'  - Evidence: “{note["evidence"]}”')
+
+    lines.extend(["", "## Action Items", ""])
+    tasks = analysis.get("tasks", [])
+    if not tasks:
+        lines.append("No action items detected.")
+    else:
+        for task in tasks:
+            status = "Complete" if task.get("Done") else "Open"
+            lines.extend(
+                [
+                    f"- **{task.get('Task Description', 'Not specified')}**",
+                    f"  - Assigned: {task.get('Assigned Person', 'Unassigned')}",
+                    f"  - Priority: {task.get('Priority', 'Medium')}",
+                    f"  - Deadline: {task.get('Deadline', 'Not specified')}",
+                    f"  - Status: {status}",
+                ]
+            )
+            if task.get("Evidence"):
+                lines.append(f'  - Evidence: “{task["Evidence"]}”')
+
+    return "\n".join(lines).strip() + "\n"
+
+
+# ==========================================
+# Page layout
+# ==========================================
 
 st.markdown(
     """
     <style>
-        #MainMenu {visibility: hidden;}
-        footer {visibility: hidden;}
-        header {visibility: hidden;}
-
-        .block-container {
-            padding-top: 2rem;
-            padding-bottom: 2rem;
+        #MainMenu, footer, header {visibility: hidden;}
+        .block-container {padding-top: 1.7rem; padding-bottom: 2rem; max-width: 1400px;}
+        [data-testid="stMetric"] {
+            background: linear-gradient(135deg, rgba(99, 102, 241, .10), rgba(14, 165, 233, .06));
+            border: 1px solid rgba(99, 102, 241, .16);
+            padding: 1rem 1.1rem;
+            border-radius: 14px;
         }
+        div[data-testid="stTabs"] button {font-weight: 600;}
     </style>
     """,
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
 
 st.title("📝 Smart Meeting & Lecture Summarizer")
-st.caption("AI-powered transcription, summaries, decisions and action items.")
-
-st.info(
-    "🔒 Audio is sent to Groq for transcription and purged from memory "
-    "immediately afterwards. Nothing is stored on disk by this app."
+st.caption(
+    "Turn a recording or transcript into grounded minutes, decisions, and an editable action board."
 )
 
-# ==========================================
-# 2. CONSTANTS
-# ==========================================
+with st.sidebar:
+    st.header("⚙️ Settings")
+    saved_api_key = get_saved_api_key()
+    manual_api_key = st.text_input(
+        "Groq API key",
+        type="password",
+        placeholder="gsk_...",
+        help="A key in Streamlit Secrets named GROQ_API_KEY is used when this field is blank.",
+        key="manual_groq_api_key",
+    )
+    api_key = manual_api_key.strip() or saved_api_key
+    if saved_api_key and not manual_api_key.strip():
+        st.caption("Using GROQ_API_KEY from Streamlit Secrets.")
+    st.caption("Audio is sent to Groq for transcription and analysis.")
+    st.divider()
+    if st.button("🧹 Clear current results", use_container_width=True):
+        st.session_state["analysis"] = None
+        st.session_state["transcript"] = ""
+        st.session_state["source_fingerprint"] = ""
+        st.session_state.pop("task_editor", None)
+        st.toast("Current results cleared.", icon="🧹")
 
-# Current Groq Whisper model
-WHISPER_MODEL = "whisper-large-v3"
+st.subheader("1. Add a recording or transcript")
+input_col1, input_col2 = st.columns(2)
 
-# If Groq changes availability, this is the only line you need to change.
-LLM_MODEL = "openai/gpt-oss-20b"
-
-MAX_AUDIO_MB = 25
-PRIORITIES = ["High", "Medium", "Low"]
-TASK_COLUMNS = ["Task Description", "Assigned Person", "Priority", "Deadline"]
-
-# Counter used in widget keys so "Clear all data" can reset uploads/mic too.
-if "reset_counter" not in st.session_state:
-    st.session_state["reset_counter"] = 0
-
-rc = st.session_state["reset_counter"]
-
-
-# ==========================================
-# 3. HELPERS
-# ==========================================
-
-def parse_deadline(value):
-    """Return a date object, or None if the value isn't a valid YYYY-MM-DD."""
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    try:
-        return datetime.strptime(str(value).strip(), "%Y-%m-%d").date()
-    except (ValueError, TypeError):
-        return None
-
-
-def fmt_deadline(value):
-    d = parse_deadline(value)
-    return d.isoformat() if d else "Not specified"
-
-
-def is_blank(value):
-    return value is None or (not isinstance(value, (date, datetime)) and pd.isna(value)) \
-        or str(value).strip() == ""
-
-
-def tasks_to_df(tasks):
-    """Convert the AI task list into a clean, editable DataFrame."""
-    rows = []
-    for t in tasks:
-        if not isinstance(t, dict):
-            continue
-        priority = str(t.get("Priority", "Medium")).strip().capitalize()
-        if priority not in PRIORITIES:
-            priority = "Medium"
-        rows.append({
-            "Done": False,
-            "Task Description": str(t.get("Task Description", "")).strip(),
-            "Assigned Person": str(t.get("Assigned Person", "Unassigned")).strip() or "Unassigned",
-            "Priority": priority,
-            "Deadline": parse_deadline(t.get("Deadline")),
-        })
-    df = pd.DataFrame(rows, columns=["Done"] + TASK_COLUMNS)
-    df["Done"] = df["Done"].astype(bool)
-    return df
-
-
-def df_to_rows(df):
-    """Turn the (possibly user-edited) table into clean dicts for exporting."""
-    rows = []
-    for _, r in df.iterrows():
-        if is_blank(r.get("Task Description")):
-            continue
-        rows.append({
-            "done": False if is_blank(r.get("Done")) else bool(r.get("Done")),
-            "task": str(r["Task Description"]).strip(),
-            "person": "Unassigned" if is_blank(r.get("Assigned Person")) else str(r["Assigned Person"]).strip(),
-            "priority": "Medium" if is_blank(r.get("Priority")) else str(r["Priority"]),
-            "deadline": parse_deadline(r.get("Deadline")),
-        })
-    return rows
-
-
-def build_markdown(summary, decisions, open_items, rows):
-    md = "# Meeting Minutes\n\n## Executive Summary\n\n"
-    md += "".join(f"- {i}\n" for i in summary) or "No summary available.\n"
-
-    md += "\n## Key Decisions\n\n"
-    md += "".join(f"- {i}\n" for i in decisions) or "No decisions detected.\n"
-
-    md += "\n## Open Discussions\n\n"
-    md += "".join(f"- {i}\n" for i in open_items) or "No open discussions.\n"
-
-    md += "\n## Action Items\n\n"
-    if rows:
-        for r in rows:
-            box = "x" if r["done"] else " "
-            md += (
-                f"- [{box}] **{r['task']}**\n"
-                f"  - **Assigned:** {r['person']}\n"
-                f"  - **Priority:** {r['priority']}\n"
-                f"  - **Deadline:** {r['deadline'].isoformat() if r['deadline'] else 'Not specified'}\n\n"
-            )
-    else:
-        md += "No action items detected.\n"
-    return md
-
-
-def _ics_escape(text):
-    return (
-        str(text).replace("\\", "\\\\").replace(";", "\\;")
-        .replace(",", "\\,").replace("\n", "\\n")
+with input_col1:
+    mic_audio = st.audio_input("🎙️ Record from microphone", key="mic_audio_input")
+    uploaded_audio = st.file_uploader(
+        "📁 Or upload an audio file",
+        type=SUPPORTED_AUDIO_TYPES,
+        help="Supported formats include MP3, WAV, M4A, WEBM, MP4, OGG, and FLAC.",
+        key="audio_file_uploader",
     )
 
+with input_col2:
+    raw_text = st.text_area(
+        "📝 Or paste a transcript",
+        height=220,
+        placeholder="Paste meeting notes, a lecture transcript, or a transcript from another tool…",
+        key="raw_transcript_input",
+    )
+    st.caption("If you provide audio and text together, the audio takes priority.")
 
-def build_ics(rows):
-    """Build an .ics calendar file: one all-day event per task that has a date."""
-    stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    lines = [
-        "BEGIN:VCALENDAR",
-        "VERSION:2.0",
-        "PRODID:-//BBIT Summarizer//Action Items//EN",
-        "CALSCALE:GREGORIAN",
-        "METHOD:PUBLISH",
-    ]
-    count = 0
-    for r in rows:
-        if not r["deadline"]:
-            continue
-        count += 1
-        start = r["deadline"]
-        end = start + timedelta(days=1)  # all-day events end the next day
-        lines += [
-            "BEGIN:VEVENT",
-            f"UID:{uuid.uuid4()}@bbit-summarizer",
-            f"DTSTAMP:{stamp}",
-            f"DTSTART;VALUE=DATE:{start.strftime('%Y%m%d')}",
-            f"DTEND;VALUE=DATE:{end.strftime('%Y%m%d')}",
-            f"SUMMARY:{_ics_escape(r['task'])}",
-            f"DESCRIPTION:{_ics_escape('Assigned to: ' + r['person'] + chr(10) + 'Priority: ' + r['priority'])}",
-            "END:VEVENT",
-        ]
-    lines.append("END:VCALENDAR")
-    return "\r\n".join(lines) + "\r\n", count
-
-
-def _pdf_safe(text):
-    # Built-in PDF fonts only support Latin-1, so replace anything else.
-    return str(text).encode("latin-1", "replace").decode("latin-1")
-
-
-def build_pdf(summary, decisions, open_items, rows):
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
-
-    def heading(text, size=13):
-        pdf.set_font("Helvetica", "B", size)
-        pdf.cell(0, 10, _pdf_safe(text), new_x="LMARGIN", new_y="NEXT")
-
-    def bullets(items, empty_text):
-        pdf.set_font("Helvetica", "", 11)
-        if not items:
-            pdf.multi_cell(0, 6, _pdf_safe(empty_text), new_x="LMARGIN", new_y="NEXT")
-        for item in items:
-            pdf.multi_cell(0, 6, _pdf_safe(f"- {item}"), new_x="LMARGIN", new_y="NEXT")
-        pdf.ln(3)
-
-    heading("Meeting Minutes", 18)
-    heading("Executive Summary")
-    bullets(summary, "No summary available.")
-    heading("Key Decisions")
-    bullets(decisions, "No decisions detected.")
-    heading("Open Discussions")
-    bullets(open_items, "No open discussions.")
-    heading("Action Items")
-
-    task_lines = [
-        f"[{'x' if r['done'] else ' '}] {r['task']}  |  Owner: {r['person']}  |  "
-        f"Priority: {r['priority']}  |  Due: {r['deadline'].isoformat() if r['deadline'] else 'Not specified'}"
-        for r in rows
-    ]
-    bullets(task_lines, "No action items detected.")
-    return bytes(pdf.output())
-
-
-def reset_everything():
-    st.session_state.pop("result", None)
-    st.session_state["reset_counter"] += 1
-
-
-# ==========================================
-# 4. API KEY
-# ==========================================
-
-api_key = st.text_input(
-    "Enter your Groq API Key:",
-    type="password",
-    placeholder="gsk_..."
-)
-
-# ==========================================
-# 5. INPUT SOURCES
-# ==========================================
-
-st.subheader("1. Input Source")
-
-mic_audio = st.audio_input("🎙️ Record from microphone", key=f"mic_{rc}")
-
-file_audio = st.file_uploader(
-    f"📁 Or upload an audio file (max {MAX_AUDIO_MB}MB)",
-    type=["mp3", "wav", "m4a", "webm"],
-    key=f"file_{rc}"
-)
-
-raw_text = st.text_area(
-    "📝 Or paste a transcript",
-    height=180,
-    placeholder="Paste your meeting or lecture transcript here...",
-    key=f"text_{rc}"
-)
-
-# ==========================================
-# 6. MAIN BUTTON
-# ==========================================
-
-if st.button(
-    "✨ Generate Minutes & Tasks",
+generate = st.button(
+    "✨ Generate minutes & tasks",
     type="primary",
-    use_container_width=True
-):
+    use_container_width=True,
+    key="generate_analysis",
+)
+
+
+# ==========================================
+# Generate / update analysis
+# ==========================================
+
+if generate:
+    audio_source = mic_audio if mic_audio is not None else uploaded_audio
+    transcript_input = raw_text.strip()
 
     if not api_key:
-        st.error("❌ Please enter your Groq API key.")
-        st.stop()
-
-    audio_src = mic_audio if mic_audio is not None else file_audio
-
-    if audio_src is None and not raw_text.strip():
-        st.error("❌ Please provide an audio file, microphone recording, or transcript.")
-        st.stop()
-
-    progress = st.progress(0, text="Starting...")
-
-    try:
-
-        client = Groq(api_key=api_key)
-        transcript = raw_text.strip()
-
-        # ==================================
-        # TRANSCRIPTION
-        # ==================================
-
-        if audio_src is not None:
-
-            progress.progress(10, text="📦 Preparing audio...")
-
-            audio_bytes = audio_src.getvalue()
-
-            if not audio_bytes:
-                progress.empty()
-                st.error("❌ The audio file appears to be empty.")
-                st.stop()
-
-            if len(audio_bytes) > MAX_AUDIO_MB * 1024 * 1024:
-                progress.empty()
-                st.error(f"❌ Audio is larger than {MAX_AUDIO_MB}MB. Please upload a shorter file.")
-                st.stop()
-
-            # Use the real filename so Groq detects the right format (mp3, m4a...)
-            audio_name = getattr(audio_src, "name", None) or "recording.wav"
-
-            progress.progress(30, text="🎙️ Transcribing audio...")
-
-            transcription = client.audio.transcriptions.create(
-                file=(audio_name, audio_bytes),
-                model=WHISPER_MODEL,
-                response_format="text"
-            )
-
-            # Privacy: drop our copy of the audio as soon as it's transcribed
-            del audio_bytes
-
-            if isinstance(transcription, str):
-                transcript = transcription.strip()
-            else:
-                transcript = getattr(transcription, "text", str(transcription)).strip()
-
-        if not transcript:
-            progress.empty()
-            st.error(
-                "❌ No speech/transcript was detected. "
-                "Try a clearer recording or paste the transcript."
-            )
-            st.stop()
-
-        # ==================================
-        # LLM PROMPT
-        # ==================================
-
-        prompt = f"""
-You are a professional meeting and lecture assistant.
-
-Analyze the transcript below.
-
-Return ONLY valid JSON.
-Do NOT use Markdown.
-Do NOT put the JSON inside ``` code fences.
-
-Use EXACTLY this structure:
-
-{{
-  "executive_summary": [
-    "bullet 1",
-    "bullet 2",
-    "bullet 3"
-  ],
-  "decisions": [
-    "decision 1"
-  ],
-  "open_discussions": [
-    "topic discussed but not resolved"
-  ],
-  "tasks": [
-    {{
-      "Task Description": "description",
-      "Assigned Person": "person or Unassigned",
-      "Priority": "High",
-      "Deadline": "YYYY-MM-DD or Not specified"
-    }}
-  ]
-}}
-
-IMPORTANT RULES:
-
-- Give exactly 3 concise executive summary bullets when enough information exists.
-- Only include decisions that are actually stated or clearly agreed upon.
-- "open_discussions" are topics raised but NOT resolved or decided.
-- Only create tasks that are actually present in the transcript.
-- Never invent people.
-- If no person is assigned, use "Unassigned".
-- If no deadline is mentioned, use "Not specified".
-- Priority must be exactly one of:
-  High
-  Medium
-  Low
-- Do not invent dates.
-- If there are no decisions, return an empty array.
-- If there are no open discussions, return an empty array.
-- If there are no tasks, return an empty array.
-
-TRANSCRIPT:
-
-{transcript}
-"""
-
-        # ==================================
-        # LLM ANALYSIS
-        # ==================================
-
-        progress.progress(65, text="🧠 Analyzing transcript...")
-
-        chat_res = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": "You return only valid JSON."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0,
-            max_tokens=4000
-        )
-
-        content = (chat_res.choices[0].message.content or "").strip()
-
-        if content.startswith("```"):
-            content = content.replace("```json", "").replace("```", "").strip()
-
-        # ==================================
-        # PARSE JSON
-        # ==================================
-
+        st.error("Add a Groq API key in the sidebar or configure GROQ_API_KEY in Streamlit Secrets.")
+    elif audio_source is None and not transcript_input:
+        st.error("Record or upload audio, or paste a transcript before generating minutes.")
+    else:
         try:
-            data = json.loads(content)
+            client = Groq(api_key=api_key)
 
-        except json.JSONDecodeError:
-
-            start = content.find("{")
-            end = content.rfind("}")
-
-            if start == -1 or end == -1:
-                raise ValueError(
-                    "The AI did not return valid JSON.\n\n"
-                    f"AI response:\n{content}"
+            if audio_source is not None:
+                audio_bytes = audio_source.getvalue()
+                fingerprint = source_hash("audio", audio_bytes)
+                cached_transcript = st.session_state.get("transcript", "")
+                use_cached = (
+                    bool(cached_transcript)
+                    and st.session_state.get("source_fingerprint") == fingerprint
                 )
 
-            try:
-                data = json.loads(content[start:end + 1])
-            except json.JSONDecodeError as json_error:
-                raise ValueError(
-                    "AI returned malformed JSON.\n\n"
-                    f"AI response:\n{content}\n\n"
-                    f"JSON error:\n{json_error}"
-                )
+                if use_cached:
+                    transcript = cached_transcript
+                    st.info("Reusing the transcript already created for this audio.")
+                else:
+                    with st.spinner("🎙️ Transcribing audio with Groq Whisper…"):
+                        transcript = transcribe_audio(client, audio_source, audio_bytes)
+                    st.session_state["transcript"] = transcript
+                    st.session_state["source_fingerprint"] = fingerprint
+            else:
+                transcript = transcript_input
+                fingerprint = source_hash("text", transcript.encode("utf-8"))
+                st.session_state["transcript"] = transcript
+                st.session_state["source_fingerprint"] = fingerprint
 
-        if not isinstance(data, dict):
-            raise ValueError("AI response was not a JSON object.")
+            if not transcript.strip():
+                st.error("No transcript was available to analyze.")
+            else:
+                with st.spinner("🧠 Analyzing the transcript…"):
+                    completion = client.chat.completions.create(
+                        model=LLM_MODEL,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You extract concise, evidence-grounded meeting and lecture "
+                                    "information. Return only the requested JSON object."
+                                ),
+                            },
+                            {"role": "user", "content": build_prompt(transcript)},
+                        ],
+                        temperature=0,
+                        max_tokens=3000,
+                    )
 
-        def as_list(key):
-            value = data.get(key, [])
-            return value if isinstance(value, list) else []
+                content = completion.choices[0].message.content or ""
+                analysis = parse_analysis(content, transcript)
+                st.session_state["analysis"] = analysis
+                st.session_state.pop("task_editor", None)
+                st.success("✅ Analysis complete. Your results are saved for this session.")
+                st.toast("Meeting minutes and tasks are ready!", icon="✅")
+                st.balloons()
 
-        # Save everything in session_state so results survive Streamlit reruns
-        # (ticking a checkbox or clicking a download button reruns the script).
-        st.session_state["result"] = {
-            "transcript": transcript,
-            "summary": as_list("executive_summary"),
-            "decisions": as_list("decisions"),
-            "open_items": as_list("open_discussions"),
-            "tasks_df": tasks_to_df(as_list("tasks")),
-        }
-
-        progress.progress(100, text="✅ Done!")
-        progress.empty()
-
-        st.success("✅ Analysis complete!")
-        st.toast("Your meeting minutes are ready!", icon="✅")
-        st.balloons()
-
-    except Exception as e:
-
-        progress.empty()
-        st.error("❌ Something went wrong.")
-
-        with st.expander("🔧 Technical error"):
-            st.code(str(e))
+        except ValueError as error:
+            st.error(str(error))
+        except Exception as error:
+            phase = "transcription" if audio_source is not None and not st.session_state.get("transcript") else "analysis"
+            st.error(friendly_api_error(error, phase))
 
 
 # ==========================================
-# 7. RESULTS (rendered from session_state)
+# Persistent results
 # ==========================================
 
-res = st.session_state.get("result")
+analysis = st.session_state.get("analysis")
 
-if res:
+if isinstance(analysis, dict):
+    tasks = analysis.get("tasks", [])
+    decisions = analysis.get("decisions", [])
+    completed_count = sum(1 for task in tasks if safe_bool(task.get("Done")))
+    pending_count = max(len(tasks) - completed_count, 0)
 
-    summary = res["summary"]
-    decisions = res["decisions"]
-    open_items = res["open_items"]
+    st.divider()
+    st.subheader(analysis.get("meeting_title", "Meeting / lecture notes"))
+    st.caption(
+        f"{analysis.get('content_type', 'Not specified')} · "
+        f"Date: {analysis.get('date', 'Not specified')} · "
+        f"Generated: {analysis.get('generated_at', 'Not specified')}"
+    )
+    st.info("AI-generated details can be incomplete; verify decisions and action items before sharing.")
 
-    with st.expander("📄 View Transcript"):
-        st.write(res["transcript"])
+    metric1, metric2, metric3 = st.columns(3)
+    metric1.metric("📋 Action items", len(tasks))
+    metric2.metric("✅ Decisions", len(decisions))
+    metric3.metric("☑️ Completed tasks", completed_count, delta=f"{pending_count} remaining")
 
-    # ---- Task board first, so metrics and exports see the user's edits ----
-
-    smart_minutes_tab, task_board_tab, exports_tab = st.tabs(
+    minutes_tab, tasks_tab, exports_tab = st.tabs(
         ["📝 Smart Minutes", "📋 Task Board", "📥 Exports"]
     )
 
-    with task_board_tab:
+    with minutes_tab:
+        summary_col, details_col = st.columns([1.25, 0.75], gap="large")
 
-        st.subheader("📋 Action-Item Matrix")
+        with summary_col:
+            st.markdown("### Executive summary")
+            if analysis.get("executive_summary"):
+                for item in analysis["executive_summary"]:
+                    st.markdown(f"- {item}")
+            else:
+                st.write("No summary points were detected.")
+
+            render_note_section("Key decisions", analysis.get("decisions", []))
+
+        with details_col:
+            render_note_section("Topics", analysis.get("topics", []))
+            render_note_section("Participants", analysis.get("participants", []))
+            render_note_section("Blockers", analysis.get("blockers", []))
+            render_note_section("Follow-ups", analysis.get("follow_ups", []))
+            render_note_section("Open questions", analysis.get("open_questions", []))
+
+        with st.expander("📄 View transcript"):
+            st.text(analysis.get("transcript", "No transcript saved."))
+
+    with tasks_tab:
+        st.markdown("### Action-item board")
         st.caption(
-            "Edit owners, priorities and dates, tick tasks off, or add a new row "
-            "at the bottom of the table. Exports use your edits."
+            "Edit cells, add rows, or mark tasks complete. Changes are saved in this Streamlit session."
         )
 
-        edited_df = st.data_editor(
-            res["tasks_df"],
-            key=f"editor_{rc}",
-            num_rows="dynamic",
+        task_df = task_dataframe(tasks)
+        st.data_editor(
+            task_df,
+            key="task_editor",
+            on_change=sync_task_editor,
             use_container_width=True,
             hide_index=True,
+            num_rows="dynamic",
+            column_order=TASK_COLUMNS,
             column_config={
-                "Done": st.column_config.CheckboxColumn("Done", default=False),
-                "Task Description": st.column_config.TextColumn("Task Description", required=True),
-                "Assigned Person": st.column_config.TextColumn("Assigned Person"),
-                "Priority": st.column_config.SelectboxColumn(
-                    "Priority", options=PRIORITIES, default="Medium", required=True
+                "Done": st.column_config.CheckboxColumn(
+                    "Done",
+                    help="Mark this action item complete.",
                 ),
-                "Deadline": st.column_config.DateColumn("Deadline", format="YYYY-MM-DD"),
-            }
+                "Task Description": st.column_config.TextColumn(
+                    "Task",
+                    help="Describe the specific action.",
+                    required=True,
+                ),
+                "Assigned Person": st.column_config.TextColumn("Assigned to"),
+                "Priority": st.column_config.SelectboxColumn(
+                    "Priority",
+                    options=PRIORITIES,
+                    required=True,
+                ),
+                "Deadline": st.column_config.TextColumn(
+                    "Deadline",
+                    help="Date or deadline stated in the transcript.",
+                ),
+            },
         )
 
-    rows = df_to_rows(edited_df)
-    done_count = sum(1 for r in rows if r["done"])
-
-    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
-    metric_col1.metric("📋 Action Items", f"{done_count}/{len(rows)} done")
-    metric_col2.metric("✅ Key Decisions", len(decisions))
-    metric_col3.metric("💬 Open Discussions", len(open_items))
-    metric_col4.metric("📌 Summary Points", len(summary))
-
-    with smart_minutes_tab:
-
-        st.subheader("📌 Executive Summary")
-        if summary:
-            for item in summary:
-                st.markdown(f"• {item}")
-        else:
-            st.write("No summary available.")
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.subheader("✅ Key Decisions")
-            if decisions:
-                for item in decisions:
-                    st.markdown(f"• {item}")
-            else:
-                st.write("No decisions detected.")
-
-        with col2:
-            st.subheader("💬 Open Discussions")
-            if open_items:
-                for item in open_items:
-                    st.markdown(f"• {item}")
-            else:
-                st.write("No open discussions.")
+        live_tasks = analysis.get("tasks", [])
+        evidence_tasks = [task for task in live_tasks if task.get("Evidence")]
+        if evidence_tasks:
+            with st.expander("🔎 Task evidence from the transcript"):
+                for task in evidence_tasks:
+                    st.markdown(f"**{task['Task Description']}**")
+                    st.caption(f'“{task["Evidence"]}”')
 
     with exports_tab:
+        st.markdown("### Download your results")
+        st.caption("Exports include the task edits currently saved in this session.")
 
-        st.subheader("📥 Export")
+        current_analysis = st.session_state.get("analysis", analysis)
+        current_tasks = current_analysis.get("tasks", [])
+        export_df = task_dataframe(current_tasks)
+        csv_data = export_df.to_csv(index=False).encode("utf-8-sig")
+        json_data = json.dumps(current_analysis, ensure_ascii=False, indent=2)
+        md_data = markdown_export(current_analysis)
 
-        md_export = build_markdown(summary, decisions, open_items, rows)
-        ics_export, ics_count = build_ics(rows)
-
-        ex1, ex2, ex3 = st.columns(3)
-
-        with ex1:
+        export_col1, export_col2, export_col3 = st.columns(3)
+        with export_col1:
             st.download_button(
-                label="📄 Download Markdown",
-                data=md_export,
+                "⬇️ Download task CSV",
+                data=csv_data,
+                file_name="meeting_tasks.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="download_tasks_csv",
+            )
+        with export_col2:
+            st.download_button(
+                "⬇️ Download full JSON",
+                data=json_data,
+                file_name="meeting_analysis.json",
+                mime="application/json",
+                use_container_width=True,
+                key="download_analysis_json",
+            )
+        with export_col3:
+            st.download_button(
+                "⬇️ Download Markdown minutes",
+                data=md_data,
                 file_name="meeting_minutes.md",
                 mime="text/markdown",
-                use_container_width=True
-            )
-
-        with ex2:
-            if PDF_AVAILABLE:
-                try:
-                    st.download_button(
-                        label="📕 Download PDF",
-                        data=build_pdf(summary, decisions, open_items, rows),
-                        file_name="meeting_minutes.pdf",
-                        mime="application/pdf",
-                        use_container_width=True
-                    )
-                except Exception as pdf_error:
-                    st.warning(f"PDF could not be generated: {pdf_error}")
-            else:
-                st.warning("PDF export needs fpdf2: pip install fpdf2")
-
-        with ex3:
-            st.download_button(
-                label="📅 Download Calendar (.ics)",
-                data=ics_export,
-                file_name="action_items.ics",
-                mime="text/calendar",
                 use_container_width=True,
-                disabled=ics_count == 0
+                key="download_minutes_markdown",
             )
 
-        if ics_count == 0:
-            st.caption("Calendar export needs at least one task with a deadline date. Add dates in the Task Board tab.")
-        else:
-            st.caption(f"Calendar file contains {ics_count} event(s), one per task with a deadline.")
+        st.caption("The JSON export contains the transcript along with analysis and task-board data.")
 
-    # ---- Privacy: wipe everything on demand ----
-
-    st.divider()
-    st.button(
-        "🗑️ Clear all data (transcript, results, uploads)",
-        on_click=reset_everything,
-        use_container_width=True
+elif st.session_state.get("transcript"):
+    st.info(
+        "A transcript is saved for this session, but analysis is not complete. "
+        "Correct any API issue and select Generate again; the same audio transcript will be reused."
     )
+
+st.caption("Powered by Groq Whisper and Groq language models · Results remain in this browser session.")
