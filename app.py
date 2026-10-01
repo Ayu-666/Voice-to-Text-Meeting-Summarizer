@@ -10,7 +10,7 @@ st.title("Smart Meeting & Lecture Summarizer (AI-03)")
 st.info("🔒 This app doesn't save audio. It is sent to Groq for transcription and analysis.")
 
 WHISPER = "whisper-large-v3-turbo"
-LLMS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+LLMS = ["llama3-70b-8192", "llama3-8b-8192", "mixtral-8x7b-32768"]
 MAX_MB = 25
 COLS = ["Task Description", "Assigned Person", "Priority", "Implied Deadline"]
 
