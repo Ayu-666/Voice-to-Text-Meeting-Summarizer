@@ -57,7 +57,7 @@ WHISPER_MODEL = "whisper-large-v3"
 # Use a currently available Groq Llama model.
 # If Groq changes availability, this is the only
 # line you need to change.
-LLM_MODEL = "llama-3.1-8b-instant"
+LLM_MODEL = "openai/gpt-oss-20b"
 
 # ==========================================
 # 5. MAIN BUTTON
