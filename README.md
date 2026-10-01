@@ -1,49 +1,29 @@
-# 🎙️ Voice-to-Text Meeting Summarizer
+# MeetMind: Smart Meeting & Lecture Summarizer (AI-03)
 
-A production-grade asynchronous corporate intelligence application designed to automate the generation of structured meeting documentation from raw audio. This application ingests audio recordings, performs rapid cloud-hosted speech-to-text transcription, and processes the text through an intelligent LLM synthesis engine to produce clear, actionable corporate notes.
+## 📌 Real-World Context
+Student club meetings, project group discussions, and long lectures often conclude without clear accountability, resulting in forgotten action items and missed deadlines[cite: 11]. MeetMind is an automated summarizer that ingests audio recordings or raw transcripts, extracts decisions made, assigns action items to named attendees, and exports them directly to calendar formats[cite: 11].
 
-By offloading both audio transcription and linguistic modeling to Groq's high-speed hardware APIs, the tool maintains zero local performance overhead and operates seamlessly without complex system-level audio dependencies (like `ffmpeg`).
-
-## 🚀 Features
-* **Asynchronous Voice Parsing:** Ingests variable-length compressed audio file formats (`.mp3`, `.wav`, `.m4a`, `.webm`, `.ogg`).
-* **High-Fidelity Cloud ASR:** Utilizes **Whisper-Large-V3** via the native Groq SDK for accurate speech recognition and punctuation.
-* **Corporate Synthesis Framework:** Leverages low-temperature **Llama 3.1 Inference** to systematically extract business value while preventing factual hallucinations.
-* **Executive Document Formatter:** Automatically maps unstructured conversations into definitive enterprise modules:
-  * 🎯 **Executive Summary:** High-level strategic overview.
-  * 🔑 **Key Discussion Points:** Structured topical vectors.
-  * ⚠️ **Action Items & Ownership:** Explicit tasks matched with personnel and target goals.
-* **Dual-Tab Developer Presentation:** Features a modular UI to view raw transcriptional data alongside completed analytical summaries.
+## 🚀 Core Features (Rubric Alignment)
+- **FR-1 (Audio/Text Input):** Upload meeting audio files (MP3/WAV up to 25MB), record via live mic, or paste raw meeting transcripts[cite: 11].
+- **FR-2 (Speech-to-Text Transcription):** Fast, accurate transcription utilizing the Groq Whisper API (`whisper-large-v3`)[cite: 11].
+- **FR-3 (Structured Meeting Minutes):** AI automatically extracts an Executive 3-bullet summary, key decisions ratified, and open discussions[cite: 11].
+- **FR-4 (Action-Item Matrix):** Extracts actionable tasks mapped to Task Description, Assigned Person, Priority, and Implied Deadline[cite: 11].
+- **FR-5 (Interactive Task Board):** Inline Kanban/checklist board where users can edit task owners, add dates, and tick off tasks before export[cite: 11].
+- **FR-6 (One-Click Export):** Export formatted meeting minutes to Markdown, PDF (via `fpdf2`), or `.ics` calendar invitation files[cite: 11].
 
 ## 🛠️ Tech Stack
-* **UI Interface:** [Streamlit](https://streamlit.io/)
-* **Orchestration Client:** [Groq Native SDK](https://github.com/groq/groq-python)
-* **Speech-to-Text Engine:** [Whisper-Large-V3](https://openai.com/research/whisper) (Cloud-hosted)
-* **Text Processing Model:** [Llama-3.1-8b-instant](https://meta.ai/)
+We deviated from the handbook's Next.js/FastAPI recommendation to optimize for zero-latency live demos and robust data handling[cite: 11].
+- **Frontend & Backend:** Streamlit (Python monolith for seamless data state management)
+- **Data Handling:** Pandas (Natively powers the Interactive Task Board)
+- **AI Processing:** Groq API (Single API for both Speech-to-Text and LLM extraction)
+- **Models Used:** `whisper-large-v3` (Audio), `openai/gpt-oss-20b` (Text Extraction)
 
-## 💻 Local Setup & Deployment
+## 🔒 Non-Functional Requirements
+- **Data Privacy Guarantee:** Audio is processed entirely in-memory and explicitly purged (`del audio_bytes`) immediately after transcription[cite: 11]. No files are saved to disk.
+- **UI/UX:** Clean typography, progress bars during transcription, and visual toast notifications[cite: 11].
 
-**1. Clone the repository**
-```bash
-git clone [https://github.com/MohibAhmadButt/Voice-to-Text-Meeting-Summarizer.git](https://github.com/MohibAhmadButt/Voice-to-Text-Meeting-Summarizer.git)
-cd Voice-to-Text-Meeting-Summarizer
-```
-**2. Isolate your virtual environment**
-```bash
-python -m venv venv
-.\venv\Scripts\activate
-```
-**3. Install dependencies**
-```Bash
-pip install -r requirements.txt
-```
-**4. Setup Local Secret Key**
-
-Create a .streamlit/secrets.toml file matching your configuration rules:
-
-GROQ_API_KEY = "gsk_your_actual_groq_api_key_here"
-
-**5. Launch the application**
-streamlit run app.py
-```bash
-streamlit run app.py
-```
+## ⚙️ Local Setup
+1. Clone the repository.
+2. Install dependencies: `pip install -r requirements.txt`
+3. Run the app: `streamlit run app.py`
+4. Enter your Groq API key in the UI sidebar to begin.
