@@ -13,6 +13,22 @@ st.set_page_config(
     layout="wide"
 )
 
+st.markdown(
+    """
+    <style>
+        #MainMenu {visibility: hidden;}
+        footer {visibility: hidden;}
+        header {visibility: hidden;}
+
+        .block-container {
+            padding-top: 2rem;
+            padding-bottom: 2rem;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
 st.title("📝 Smart Meeting & Lecture Summarizer")
 st.caption("AI-powered transcription, summaries, decisions and action items.")
 
@@ -289,125 +305,139 @@ TRANSCRIPT:
         # ==================================
 
         st.success("✅ Analysis complete!")
+        st.toast("Your meeting minutes are ready!", icon="✅")
+        st.balloons()
 
         # ==================================
-        # 14. SUMMARY + DECISIONS
+        # 14. METRICS DASHBOARD
         # ==================================
 
-        col1, col2 = st.columns(2)
+        metric_col1, metric_col2, metric_col3 = st.columns(3)
 
-        with col1:
-
-            st.subheader("📌 Executive Summary")
-
-            if summary:
-
-                for item in summary:
-                    st.markdown(f"• {item}")
-
-            else:
-                st.write("No summary available.")
-
-        with col2:
-
-            st.subheader("✅ Key Decisions")
-
-            if decisions:
-
-                for item in decisions:
-                    st.markdown(f"• {item}")
-
-            else:
-                st.write("No decisions detected.")
+        metric_col1.metric("📋 Action Items", len(tasks))
+        metric_col2.metric("✅ Key Decisions", len(decisions))
+        metric_col3.metric("📌 Summary Points", len(summary))
 
         # ==================================
-        # 15. ACTION ITEMS
+        # 15. TABBED RESULTS
         # ==================================
 
-        st.subheader("📋 Action-Item Matrix")
-
-        if tasks:
-
-            df = pd.DataFrame(tasks)
-
-            # Make sure expected columns exist
-
-            expected_columns = [
-                "Task Description",
-                "Assigned Person",
-                "Priority",
-                "Deadline"
-            ]
-
-            for column in expected_columns:
-
-                if column not in df.columns:
-                    df[column] = "Not specified"
-
-            df = df[expected_columns]
-
-            df.insert(0, "Done", False)
-
-            edited_df = st.data_editor(
-                df,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Done": st.column_config.CheckboxColumn(
-                        "Done"
-                    )
-                }
-            )
-
-        else:
-
-            st.write("No action items detected.")
-
-        # ==================================
-        # 16. EXPORT
-        # ==================================
-
-        st.subheader("📥 Export")
-
-        md_export = "# Meeting Minutes\n\n"
-
-        md_export += "## Executive Summary\n\n"
-
-        for item in summary:
-            md_export += f"- {item}\n"
-
-        md_export += "\n## Key Decisions\n\n"
-
-        for item in decisions:
-            md_export += f"- {item}\n"
-
-        md_export += "\n## Action Items\n\n"
-
-        if tasks:
-
-            for task in tasks:
-
-                md_export += (
-                    f"- **Task:** {task.get('Task Description', 'Not specified')}\n"
-                    f"  - **Assigned:** {task.get('Assigned Person', 'Unassigned')}\n"
-                    f"  - **Priority:** {task.get('Priority', 'Medium')}\n"
-                    f"  - **Deadline:** {task.get('Deadline', 'Not specified')}\n\n"
-                )
-
-        else:
-
-            md_export += "No action items detected.\n"
-
-        st.download_button(
-            label="📥 Download Markdown",
-            data=md_export,
-            file_name="meeting_minutes.md",
-            mime="text/markdown",
-            use_container_width=True
+        smart_minutes_tab, task_board_tab, exports_tab = st.tabs(
+            ["📝 Smart Minutes", "📋 Task Board", "📥 Exports"]
         )
 
+        with smart_minutes_tab:
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+
+                st.subheader("📌 Executive Summary")
+
+                if summary:
+
+                    for item in summary:
+                        st.markdown(f"• {item}")
+
+                else:
+                    st.write("No summary available.")
+
+            with col2:
+
+                st.subheader("✅ Key Decisions")
+
+                if decisions:
+
+                    for item in decisions:
+                        st.markdown(f"• {item}")
+
+                else:
+                    st.write("No decisions detected.")
+
+        with task_board_tab:
+
+            st.subheader("📋 Action-Item Matrix")
+
+            if tasks:
+
+                df = pd.DataFrame(tasks)
+
+                # Make sure expected columns exist
+
+                expected_columns = [
+                    "Task Description",
+                    "Assigned Person",
+                    "Priority",
+                    "Deadline"
+                ]
+
+                for column in expected_columns:
+
+                    if column not in df.columns:
+                        df[column] = "Not specified"
+
+                df = df[expected_columns]
+
+                df.insert(0, "Done", False)
+
+                edited_df = st.data_editor(
+                    df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Done": st.column_config.CheckboxColumn(
+                            "Done"
+                        )
+                    }
+                )
+
+            else:
+
+                st.write("No action items detected.")
+
+        with exports_tab:
+
+            st.subheader("📥 Export")
+
+            md_export = "# Meeting Minutes\n\n"
+
+            md_export += "## Executive Summary\n\n"
+
+            for item in summary:
+                md_export += f"- {item}\n"
+
+            md_export += "\n## Key Decisions\n\n"
+
+            for item in decisions:
+                md_export += f"- {item}\n"
+
+            md_export += "\n## Action Items\n\n"
+
+            if tasks:
+
+                for task in tasks:
+
+                    md_export += (
+                        f"- **Task:** {task.get('Task Description', 'Not specified')}\n"
+                        f"  - **Assigned:** {task.get('Assigned Person', 'Unassigned')}\n"
+                        f"  - **Priority:** {task.get('Priority', 'Medium')}\n"
+                        f"  - **Deadline:** {task.get('Deadline', 'Not specified')}\n\n"
+                    )
+
+            else:
+
+                md_export += "No action items detected.\n"
+
+            st.download_button(
+                label="📥 Download Markdown",
+                data=md_export,
+                file_name="meeting_minutes.md",
+                mime="text/markdown",
+                use_container_width=True
+            )
+
     # ======================================
-    # 17. ERROR HANDLING
+    # 16. ERROR HANDLING
     # ======================================
 
     except Exception as e:
